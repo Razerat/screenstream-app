@@ -12,18 +12,16 @@ const PORT = process.env.PORT || 3000;
 const app = express();
 const server = http.createServer(app);
 
-// Habilitar CORS completo no Express para suportar chamadas do Netlify e Localtunnel
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Origin', 'X-Requested-With', 'Content-Type', 'Accept', 'Authorization', 'Bypass-Tunnel-Remainder', 'bypass-tunnel-reminder']
+  allowedHeaders: ['Origin', 'X-Requested-With', 'Content-Type', 'Accept', 'Authorization']
 }));
 
-// Fallback manual de cabeçalhos CORS
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization, Bypass-Tunnel-Remainder, bypass-tunnel-reminder");
+  res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization");
   if (req.method === 'OPTIONS') {
     return res.sendStatus(200);
   }
@@ -40,8 +38,33 @@ const io = new Server(server, {
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
+app.get('/', (req, res) => {
+  res.json({
+    status: "ok",
+    message: "Servidor Backend ScreenStream está 100% Online e Ativo!",
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Middleware de Autenticação JWT para API
+function authMiddleware(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Não autenticado.' });
+  }
+
+  const token = authHeader.split(' ')[1];
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch (err) {
+    res.status(401).json({ error: 'Token inválido ou expirado.' });
+  }
+}
+
 // ============================================================================
-// API DE AUTENTICAÇÃO (CORS HABILITADO)
+// API DE AUTENTICAÇÃO & SISTEMA DE AMIGOS
 // ============================================================================
 app.post('/api/register', (req, res) => {
   try {
@@ -82,27 +105,52 @@ app.post('/api/login', (req, res) => {
   }
 });
 
-app.get('/api/me', (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Não autenticado.' });
-  }
+app.get('/api/me', authMiddleware, (req, res) => {
+  const user = db.getUserById(req.user.id);
+  if (!user) return res.status(401).json({ error: 'Usuário não encontrado.' });
+  res.json({ user });
+});
 
-  const token = authHeader.split(' ')[1];
+// Endpoints da Lista de Amigos
+app.get('/api/friends', authMiddleware, (req, res) => {
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    const user = db.getUserById(decoded.id);
-    if (!user) return res.status(401).json({ error: 'Usuário não encontrado.' });
-    res.json({ user });
+    const friends = db.getFriendsList(req.user.id);
+    res.json({ friends });
   } catch (err) {
-    res.status(401).json({ error: 'Token inválido ou expirado.' });
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.post('/api/friends/request', authMiddleware, (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'E-mail do amigo é obrigatório.' });
+
+    const result = db.sendFriendRequest(req.user.id, email);
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.post('/api/friends/accept', authMiddleware, (req, res) => {
+  try {
+    const { friendId } = req.body;
+    if (!friendId) return res.status(400).json({ error: 'ID do amigo é obrigatório.' });
+
+    const result = db.acceptFriendRequest(req.user.id, friendId);
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
   }
 });
 
 // ============================================================================
-// SOCKET.IO REALTIME SIGNALING, CHAT & ONLINE USERS TRACKER
+// SOCKET.IO REALTIME SIGNALING, CHAT, AMIGOS & ONLINE TRACKER
 // ============================================================================
 const rooms = new Map();
+// Key: userId -> { socketId, userId, name, isBroadcasting, roomId }
+const activeUserSockets = new Map();
 
 function generateRoomId() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -146,6 +194,31 @@ function broadcastRoomUsers(roomId) {
   });
 }
 
+function notifyFriendsPresence(userId) {
+  const friends = db.getFriendsList(userId);
+  if (!friends || friends.length === 0) return;
+
+  friends.forEach(f => {
+    const friendSocketInfo = activeUserSockets.get(f.id);
+    if (friendSocketInfo) {
+      // Enviar lista atualizada de amigos ao amigo conectado
+      const friendUserFriends = db.getFriendsList(f.id).map(myFriend => {
+        const socketInfo = activeUserSockets.get(myFriend.id);
+        return {
+          ...myFriend,
+          isOnline: !!socketInfo,
+          isBroadcasting: socketInfo ? socketInfo.isBroadcasting : false,
+          roomId: socketInfo ? socketInfo.roomId : null
+        };
+      });
+
+      io.to(friendSocketInfo.socketId).emit('friends-presence-update', {
+        friends: friendUserFriends
+      });
+    }
+  });
+}
+
 io.use((socket, next) => {
   const token = socket.handshake.auth.token || socket.handshake.headers.token;
   if (token) {
@@ -161,10 +234,98 @@ io.use((socket, next) => {
 
 io.on('connection', (socket) => {
   const userName = socket.user ? socket.user.name : `Visitante_${socket.id.substring(0, 4)}`;
+  const userId = socket.user ? socket.user.id : socket.id;
   socket.userName = userName;
+  socket.userId = userId;
 
-  console.log(`[Socket Connected] ID: ${socket.id} | Usuário: ${userName}`);
+  if (socket.user) {
+    activeUserSockets.set(userId, {
+      socketId: socket.id,
+      userId,
+      name: userName,
+      isBroadcasting: false,
+      roomId: null
+    });
+    notifyFriendsPresence(userId);
+  }
 
+  console.log(`[Socket Connected] ID: ${socket.id} | Usuário: ${userName} (${userId})`);
+
+  // Obter presença atualizada de amigos
+  socket.on('get-friends-presence', () => {
+    if (!socket.user) return;
+    const friends = db.getFriendsList(socket.user.id).map(myFriend => {
+      const socketInfo = activeUserSockets.get(myFriend.id);
+      return {
+        ...myFriend,
+        isOnline: !!socketInfo,
+        isBroadcasting: socketInfo ? socketInfo.isBroadcasting : false,
+        roomId: socketInfo ? socketInfo.roomId : null
+      };
+    });
+    socket.emit('friends-presence-update', { friends });
+  });
+
+  // Entrar na transmissão de um amigo diretamente pelo ID do amigo (SEM CÓDIGO DE SALA!)
+  socket.on('join-friend-stream', ({ friendId }) => {
+    let targetRoomId = null;
+    let targetPresenterId = null;
+
+    // Procurar sala criada pelo amigo
+    for (const [rId, room] of rooms.entries()) {
+      if (room.presenterUserId === friendId || room.presenterId === friendId) {
+        targetRoomId = rId;
+        targetPresenterId = room.presenterId;
+        break;
+      }
+    }
+
+    if (!targetRoomId) {
+      // Procurar se o amigo está transmitindo via activeUserSockets
+      const socketInfo = activeUserSockets.get(friendId);
+      if (socketInfo && socketInfo.roomId) {
+        targetRoomId = socketInfo.roomId;
+        targetPresenterId = socketInfo.socketId;
+      }
+    }
+
+    if (!targetRoomId) {
+      return socket.emit('room-error', { message: 'Este amigo não está transmitindo nenhuma tela no momento.' });
+    }
+
+    const room = rooms.get(targetRoomId);
+    if (!room) {
+      return socket.emit('room-error', { message: 'Transmissão não encontrada.' });
+    }
+
+    room.viewers.set(socket.id, userName);
+    socket.join(targetRoomId);
+    socket.roomId = targetRoomId;
+    socket.isPresenter = false;
+
+    console.log(`[Assistindo Amigo] ${userName} entrou na transmissão de ${room.presenterName} (Sala ${targetRoomId})`);
+
+    socket.emit('room-joined', { 
+      roomId: targetRoomId,
+      presenterId: room.presenterId,
+      presenterName: room.presenterName,
+      isBroadcasting: room.isBroadcasting
+    });
+
+    io.to(room.presenterId).emit('viewer-joined', { 
+      viewerId: socket.id,
+      viewerName: userName,
+      totalViewers: room.viewers.size
+    });
+
+    io.to(targetRoomId).emit('chat-system-message', {
+      text: `${userName} entrou na sala.`
+    });
+
+    broadcastRoomUsers(targetRoomId);
+  });
+
+  // Apresentador cria sala
   socket.on('create-room', () => {
     for (const [id, room] of rooms.entries()) {
       if (room.presenterId === socket.id) {
@@ -180,6 +341,7 @@ io.on('connection', (socket) => {
 
     rooms.set(roomId, {
       presenterId: socket.id,
+      presenterUserId: userId,
       presenterName: userName,
       viewers: new Map(),
       isBroadcasting: true,
@@ -190,11 +352,21 @@ io.on('connection', (socket) => {
     socket.roomId = roomId;
     socket.isPresenter = true;
 
+    if (socket.user) {
+      const info = activeUserSockets.get(userId);
+      if (info) {
+        info.isBroadcasting = true;
+        info.roomId = roomId;
+      }
+      notifyFriendsPresence(userId);
+    }
+
     console.log(`[Sala Criada] Code: ${roomId} | Presenter: ${userName}`);
     socket.emit('room-created', { roomId, presenterName: userName });
     broadcastRoomUsers(roomId);
   });
 
+  // Espectador entra via código de sala
   socket.on('join-room', ({ roomId }) => {
     const cleanRoomId = roomId ? roomId.trim().toUpperCase() : '';
     const room = rooms.get(cleanRoomId);
@@ -269,11 +441,25 @@ io.on('connection', (socket) => {
         socket.to(socket.roomId).emit('presenter-left');
         broadcastRoomUsers(socket.roomId);
         rooms.delete(socket.roomId);
+
+        if (socket.user) {
+          const info = activeUserSockets.get(userId);
+          if (info) {
+            info.isBroadcasting = false;
+            info.roomId = null;
+          }
+          notifyFriendsPresence(userId);
+        }
       }
     }
   });
 
   socket.on('disconnect', () => {
+    if (socket.user) {
+      activeUserSockets.delete(userId);
+      notifyFriendsPresence(userId);
+    }
+
     if (socket.roomId && rooms.has(socket.roomId)) {
       const room = rooms.get(socket.roomId);
 
@@ -297,7 +483,7 @@ io.on('connection', (socket) => {
 
 server.listen(PORT, () => {
   console.log(`====================================================`);
-  console.log(` Servidor ScreenStream (CORS Habilitado + Auth + Chat) ON!`);
+  console.log(` Servidor ScreenStream (Amigos + Stream 1-Click) ON!`);
   console.log(` Acesse localmente em: http://localhost:${PORT}`);
   console.log(`====================================================`);
 });
