@@ -41,12 +41,11 @@ app.use(express.static(path.join(__dirname, 'public')));
 app.get('/', (req, res) => {
   res.json({
     status: "ok",
-    message: "Servidor Backend ScreenStream está 100% Online e Ativo!",
+    message: "Servidor Backend ScreenStream está 100% Online e Ativo com Atualizações em Tempo Real!",
     timestamp: new Date().toISOString()
   });
 });
 
-// Middleware de Autenticação JWT para API
 function authMiddleware(req, res, next) {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -64,7 +63,7 @@ function authMiddleware(req, res, next) {
 }
 
 // ============================================================================
-// API DE AUTENTICAÇÃO & SISTEMA DE AMIGOS
+// API DE AUTENTICAÇÃO & AMIGOS
 // ============================================================================
 app.post('/api/register', (req, res) => {
   try {
@@ -111,7 +110,6 @@ app.get('/api/me', authMiddleware, (req, res) => {
   res.json({ user });
 });
 
-// Endpoints da Lista de Amigos
 app.get('/api/friends', authMiddleware, (req, res) => {
   try {
     const friends = db.getFriendsList(req.user.id);
@@ -127,6 +125,9 @@ app.post('/api/friends/request', authMiddleware, (req, res) => {
     if (!email) return res.status(400).json({ error: 'E-mail do amigo é obrigatório.' });
 
     const result = db.sendFriendRequest(req.user.id, email);
+    
+    // Notificar instantaneamente o amigo via Socket.io se estiver conectado!
+    notifyFriendsPresence(req.user.id);
     res.json(result);
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -139,6 +140,10 @@ app.post('/api/friends/accept', authMiddleware, (req, res) => {
     if (!friendId) return res.status(400).json({ error: 'ID do amigo é obrigatório.' });
 
     const result = db.acceptFriendRequest(req.user.id, friendId);
+    
+    // Notificar instantaneamente ambos os amigos via Socket.io!
+    notifyFriendsPresence(req.user.id);
+    notifyFriendsPresence(friendId);
     res.json(result);
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -146,20 +151,10 @@ app.post('/api/friends/accept', authMiddleware, (req, res) => {
 });
 
 // ============================================================================
-// SOCKET.IO REALTIME SIGNALING, CHAT, AMIGOS & ONLINE TRACKER
+// SOCKET.IO BIDIRECIONAL REALTIME SIGNALING, CHAT & PRESENCE TRACKER
 // ============================================================================
 const rooms = new Map();
-// Key: userId -> { socketId, userId, name, isBroadcasting, roomId }
 const activeUserSockets = new Map();
-
-function generateRoomId() {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let result = '';
-  for (let i = 0; i < 6; i++) {
-    result += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return result;
-}
 
 function broadcastRoomUsers(roomId) {
   const room = rooms.get(roomId);
@@ -194,14 +189,34 @@ function broadcastRoomUsers(roomId) {
   });
 }
 
+// Notificação Bidirecional de Presença de Amigos (Quem entra vê quem tá online e vice-versa!)
 function notifyFriendsPresence(userId) {
+  const userSocketInfo = activeUserSockets.get(userId);
+  
+  // 1. Enviar presença completa de todos os amigos para o PRÓPRIO usuário
+  if (userSocketInfo) {
+    const myFriendsList = db.getFriendsList(userId).map(f => {
+      const socketInfo = activeUserSockets.get(f.id);
+      return {
+        ...f,
+        isOnline: !!socketInfo,
+        isBroadcasting: socketInfo ? socketInfo.isBroadcasting : false,
+        roomId: socketInfo ? socketInfo.roomId : null
+      };
+    });
+
+    io.to(userSocketInfo.socketId).emit('friends-presence-update', {
+      friends: myFriendsList
+    });
+  }
+
+  // 2. Notificar todos os amigos conectados que o status deste usuário mudou
   const friends = db.getFriendsList(userId);
   if (!friends || friends.length === 0) return;
 
   friends.forEach(f => {
     const friendSocketInfo = activeUserSockets.get(f.id);
     if (friendSocketInfo) {
-      // Enviar lista atualizada de amigos ao amigo conectado
       const friendUserFriends = db.getFriendsList(f.id).map(myFriend => {
         const socketInfo = activeUserSockets.get(myFriend.id);
         return {
@@ -246,46 +261,31 @@ io.on('connection', (socket) => {
       isBroadcasting: false,
       roomId: null
     });
+    // Notificar imediatamente o usuário e seus amigos!
     notifyFriendsPresence(userId);
   }
 
   console.log(`[Socket Connected] ID: ${socket.id} | Usuário: ${userName} (${userId})`);
 
-  // Obter presença atualizada de amigos
   socket.on('get-friends-presence', () => {
     if (!socket.user) return;
-    const friends = db.getFriendsList(socket.user.id).map(myFriend => {
-      const socketInfo = activeUserSockets.get(myFriend.id);
-      return {
-        ...myFriend,
-        isOnline: !!socketInfo,
-        isBroadcasting: socketInfo ? socketInfo.isBroadcasting : false,
-        roomId: socketInfo ? socketInfo.roomId : null
-      };
-    });
-    socket.emit('friends-presence-update', { friends });
+    notifyFriendsPresence(socket.user.id);
   });
 
-  // Entrar na transmissão de um amigo diretamente pelo ID do amigo (SEM CÓDIGO DE SALA!)
   socket.on('join-friend-stream', ({ friendId }) => {
     let targetRoomId = null;
-    let targetPresenterId = null;
 
-    // Procurar sala criada pelo amigo
     for (const [rId, room] of rooms.entries()) {
       if (room.presenterUserId === friendId || room.presenterId === friendId) {
         targetRoomId = rId;
-        targetPresenterId = room.presenterId;
         break;
       }
     }
 
     if (!targetRoomId) {
-      // Procurar se o amigo está transmitindo via activeUserSockets
       const socketInfo = activeUserSockets.get(friendId);
       if (socketInfo && socketInfo.roomId) {
         targetRoomId = socketInfo.roomId;
-        targetPresenterId = socketInfo.socketId;
       }
     }
 
@@ -325,7 +325,6 @@ io.on('connection', (socket) => {
     broadcastRoomUsers(targetRoomId);
   });
 
-  // Apresentador cria sala
   socket.on('create-room', () => {
     for (const [id, room] of rooms.entries()) {
       if (room.presenterId === socket.id) {
@@ -366,7 +365,6 @@ io.on('connection', (socket) => {
     broadcastRoomUsers(roomId);
   });
 
-  // Espectador entra via código de sala
   socket.on('join-room', ({ roomId }) => {
     const cleanRoomId = roomId ? roomId.trim().toUpperCase() : '';
     const room = rooms.get(cleanRoomId);
@@ -483,7 +481,7 @@ io.on('connection', (socket) => {
 
 server.listen(PORT, () => {
   console.log(`====================================================`);
-  console.log(` Servidor ScreenStream (Amigos + Stream 1-Click) ON!`);
+  console.log(` Servidor ScreenStream (Amigos Realtime Sync) ON!`);
   console.log(` Acesse localmente em: http://localhost:${PORT}`);
   console.log(`====================================================`);
 });
