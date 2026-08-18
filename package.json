@@ -1,0 +1,63 @@
+{
+  "name": "webrtc-screen-share",
+  "version": "1.0.0",
+  "description": "Aplicação de compartilhamento de tela em tempo real com WebRTC, Autenticação, Chat e Suporte Desktop .EXE",
+  "main": "main-electron.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "electron": "electron main-electron.js",
+    "dist": "electron-builder --win nsis portable",
+    "pack": "electron-builder --dir"
+  },
+  "keywords": [
+    "webrtc",
+    "screen-sharing",
+    "socket.io",
+    "express",
+    "nodejs",
+    "electron",
+    "chat"
+  ],
+  "author": "ScreenStream Team",
+  "license": "MIT",
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.6",
+    "express": "^4.19.2",
+    "jsonwebtoken": "^9.0.2",
+    "socket.io": "^4.7.5"
+  },
+  "devDependencies": {
+    "electron": "^30.0.0",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.screenstream.app",
+    "productName": "ScreenStream Desktop",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "server.js",
+      "database.js",
+      "main-electron.js",
+      "public/**/*",
+      "node_modules/**/*"
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ],
+      "icon": "public/favicon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "ScreenStream"
+    }
+  }
+}
